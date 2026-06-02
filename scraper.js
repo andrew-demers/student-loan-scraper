@@ -9,12 +9,10 @@ config();
 const USERNAME = process.env.NELNET_USERNAME;
 const PASSWORD = process.env.NELNET_PASSWORD;
 
-/** Optional: IMAP app password–based email MFA (see script header / mfa-email.js). */
-const MFA_IMAP_HOST = process.env.MFA_IMAP_HOST;
-const MFA_IMAP_PORT = process.env.MFA_IMAP_PORT ? Number(process.env.MFA_IMAP_PORT) : 993;
-const MFA_IMAP_USER = process.env.MFA_IMAP_USER;
-const MFA_IMAP_PASSWORD = process.env.MFA_IMAP_PASSWORD;
-const MFA_IMAP_MAILBOX = process.env.MFA_IMAP_MAILBOX || 'INBOX';
+/** Optional: Gmail API–based email MFA. Run `npm run setup-gmail-auth` once to get the refresh token. */
+const GMAIL_CLIENT_ID = process.env.GMAIL_CLIENT_ID;
+const GMAIL_CLIENT_SECRET = process.env.GMAIL_CLIENT_SECRET;
+const GMAIL_REFRESH_TOKEN = process.env.GMAIL_REFRESH_TOKEN;
 const MFA_EMAIL_FROM_CONTAINS = process.env.MFA_EMAIL_FROM_CONTAINS;
 const MFA_EMAIL_SUBJECT_CONTAINS = process.env.MFA_EMAIL_SUBJECT_CONTAINS;
 
@@ -429,8 +427,8 @@ async function prepareEmailMfaFlow(surface) {
   return picked || sent;
 }
 
-function imapMfaConfigured() {
-  return Boolean(MFA_IMAP_HOST && MFA_IMAP_USER && MFA_IMAP_PASSWORD);
+function gmailMfaConfigured() {
+  return Boolean(GMAIL_CLIENT_ID && GMAIL_CLIENT_SECRET && GMAIL_REFRESH_TOKEN);
 }
 
 /** Open hamburger / main nav if common controls exist (mobile or collapsed nav). */
@@ -908,22 +906,17 @@ async function scrapeNelnet() {
       // Timestamp after triggering send so IMAP ignores older unrelated messages
       const notBefore = prepared ? new Date() : new Date(Date.now() - 2 * 60 * 1000);
 
-      if (imapMfaConfigured()) {
-        console.log('\nEmail MFA: polling inbox via IMAP...');
+      if (gmailMfaConfigured()) {
+        console.log('\nEmail MFA: polling inbox via Gmail API...');
         await activePage.waitForTimeout(prepared ? 1000 : 2500);
-        const imapMax = Number(process.env.MFA_IMAP_MAX_WAIT_MS);
+        const maxWaitMs = Number(process.env.MFA_IMAP_MAX_WAIT_MS);
         const code = await waitForEmailCode({
-          host: MFA_IMAP_HOST,
-          port: MFA_IMAP_PORT,
-          user: MFA_IMAP_USER,
-          password: MFA_IMAP_PASSWORD,
-          mailbox: MFA_IMAP_MAILBOX,
+          clientId: GMAIL_CLIENT_ID,
+          clientSecret: GMAIL_CLIENT_SECRET,
+          refreshToken: GMAIL_REFRESH_TOKEN,
           notBefore,
-          maxWaitMs: Number.isFinite(imapMax) && imapMax > 0 ? imapMax : undefined,
-          // Nelnet MFA comes from NelnetNoReply / *@*nelnet* unless you set MFA_EMAIL_FROM_CONTAINS.
-          fromContains: MFA_EMAIL_FROM_CONTAINS?.trim()
-            ? MFA_EMAIL_FROM_CONTAINS
-            : 'nelnet',
+          maxWaitMs: Number.isFinite(maxWaitMs) && maxWaitMs > 0 ? maxWaitMs : undefined,
+          fromContains: MFA_EMAIL_FROM_CONTAINS?.trim() ? MFA_EMAIL_FROM_CONTAINS : 'nelnet',
           subjectContains: MFA_EMAIL_SUBJECT_CONTAINS || undefined,
         });
         console.log('Entering code from email and submitting...');
@@ -931,7 +924,7 @@ async function scrapeNelnet() {
         await activePage.waitForLoadState('load', { timeout: 60_000 }).catch(() => {});
       } else {
         console.log(
-          '\nMFA required. To auto-read email, set MFA_IMAP_HOST, MFA_IMAP_USER, MFA_IMAP_PASSWORD (app password).',
+          '\nMFA required. To auto-read email, run `npm run setup-gmail-auth` to configure Gmail API access.',
         );
         console.log('Otherwise enter the code in the browser, then press Enter here...');
         await new Promise((resolve) => process.stdin.once('data', resolve));

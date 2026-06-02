@@ -1,7 +1,6 @@
-import { ImapFlow } from 'imapflow';
-import { simpleParser } from 'mailparser';
+import { google } from 'googleapis';
+import { Buffer } from 'buffer';
 
-/** Pull 6–8 digit codes and common formatted variants from mail text. */
 function extractOtpFromText(text) {
   if (!text) return null;
   const flat = text.replace(/\s+/g, ' ');
@@ -20,9 +19,6 @@ function extractOtpFromText(text) {
   return null;
 }
 
-/**
- * Nelnet / NelnetNoReply template: <p class="h2 text-gray text-center ...">807166</p>
- */
 function extractNelnetOtpFromHtml(html) {
   if (!html || typeof html !== 'string') return null;
   const patterns = [
@@ -37,40 +33,45 @@ function extractNelnetOtpFromHtml(html) {
   return null;
 }
 
-function senderBlob(envelope) {
-  const f = envelope?.from?.[0];
-  return [f?.address, f?.name].filter(Boolean).join(' ').toLowerCase();
-}
+function decodeBody(payload) {
+  const result = { text: '', html: '' };
+  if (!payload) return result;
 
-function fromMatches(envelope, needle) {
-  if (!needle?.trim()) return true;
-  return senderBlob(envelope).includes(needle.toLowerCase().trim());
+  if (payload.body?.data) {
+    const decoded = Buffer.from(payload.body.data, 'base64url').toString('utf8');
+    if (payload.mimeType === 'text/html') result.html = decoded;
+    else result.text = decoded;
+  }
+
+  for (const part of payload.parts || []) {
+    const sub = decodeBody(part);
+    result.text += sub.text;
+    result.html += sub.html;
+  }
+
+  return result;
 }
 
 /**
- * Poll IMAP for a recent message and extract an OTP. Use an app-specific password,
- * not your main account password (Gmail: Google Account → Security → App passwords).
+ * Poll Gmail API for a recent Nelnet MFA code. Requires OAuth2 credentials
+ * (GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN in .env).
+ * Run `npm run setup-gmail-auth` once to obtain the refresh token.
  *
  * @param {object} opts
- * @param {string} opts.host - e.g. imap.gmail.com, outlook.office365.com
- * @param {number} [opts.port=993]
- * @param {string} opts.user
- * @param {string} opts.password
- * @param {string} [opts.mailbox=INBOX]
- * @param {Date} [opts.notBefore] - ignore messages strictly older than this (received time)
- * @param {string} [opts.fromContains] - sender substring filter, e.g. studentaid.gov
- * @param {string} [opts.subjectContains] - subject substring filter, e.g. security
+ * @param {string} opts.clientId
+ * @param {string} opts.clientSecret
+ * @param {string} opts.refreshToken
+ * @param {Date} [opts.notBefore]
+ * @param {string} [opts.fromContains]
+ * @param {string} [opts.subjectContains]
  * @param {number} [opts.maxWaitMs=180000]
  * @param {number} [opts.pollIntervalMs=4000]
- * @param {boolean} [opts.debug] - log skip reasons to stderr
  */
 export async function waitForEmailCode(opts) {
   const {
-    host,
-    port = 993,
-    user,
-    password,
-    mailbox = 'INBOX',
+    clientId,
+    clientSecret,
+    refreshToken,
     notBefore = new Date(Date.now() - 3 * 60 * 1000),
     fromContains,
     subjectContains,
@@ -79,108 +80,60 @@ export async function waitForEmailCode(opts) {
     debug = process.env.MFA_IMAP_DEBUG === '1' || process.env.MFA_IMAP_DEBUG === 'true',
   } = opts;
 
-  /** Allow server/local clock skew so we don’t drop the mail that just arrived. */
-  const cutoff = new Date(notBefore.getTime() - 3 * 60 * 1000);
+  const oauth2Client = new google.auth.OAuth2(clientId, clientSecret);
+  oauth2Client.setCredentials({ refresh_token: refreshToken });
+  const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
 
+  const cutoff = new Date(notBefore.getTime() - 3 * 60 * 1000);
+  const afterTs = Math.floor(cutoff.getTime() / 1000);
   const deadline = Date.now() + maxWaitMs;
-  let lastErr;
-  const dbg = (...args) => {
-    if (debug) console.error('[mfa-imap]', ...args);
-  };
+
+  const dbg = (...args) => { if (debug) console.error('[mfa-gmail]', ...args); };
+
+  const queryParts = [`after:${afterTs}`];
+  if (fromContains?.trim()) queryParts.push(`from:${fromContains.trim()}`);
+  if (subjectContains?.trim()) queryParts.push(`subject:${subjectContains.trim()}`);
+  const query = queryParts.join(' ');
+  dbg('search query:', query);
 
   while (Date.now() < deadline) {
-    const client = new ImapFlow({
-      host,
-      port,
-      secure: true,
-      auth: { user, pass: password },
-      logger: false,
-    });
-
     try {
-      await client.connect();
-      await client.mailboxOpen(mailbox);
+      const listRes = await gmail.users.messages.list({ userId: 'me', q: query, maxResults: 20 });
+      const messages = listRes.data.messages || [];
+      dbg(`found ${messages.length} messages`);
 
-      const uidSet = new Set();
-      const addUids = (arr) => {
-        if (Array.isArray(arr)) for (const u of arr) uidSet.add(u);
-      };
+      for (const { id } of messages) {
+        const msgRes = await gmail.users.messages.get({ userId: 'me', id, format: 'full' });
+        const msg = msgRes.data;
 
-      addUids(await client.search({ unseen: true }, { uid: true }).catch(() => []));
-      const sinceWide = new Date(Math.max(cutoff.getTime() - 24 * 60 * 60 * 1000, Date.now() - 7 * 24 * 60 * 60 * 1000));
-      addUids(await client.search({ since: sinceWide }, { uid: true }).catch(() => []));
-      if (uidSet.size < 10) {
-        addUids(await client.search({ since: new Date(Date.now() - 24 * 60 * 60 * 1000) }, { uid: true }).catch(() => []));
-      }
-
-      const sorted = [...uidSet].sort((a, b) => b - a).slice(0, 60);
-      if (!sorted.length) {
-        dbg('no UIDs from IMAP search (unseen/since); mailbox', mailbox);
-        await client.logout();
-        await new Promise((r) => setTimeout(r, pollIntervalMs));
-        continue;
-      }
-
-      for (const uid of sorted) {
-        const msg = await client.fetchOne(
-          String(uid),
-          { source: true, envelope: true, internalDate: true },
-          { uid: true },
-        );
-        if (!msg?.source) continue;
-
-        const env = msg.envelope;
-        const subject = env?.subject ?? '';
-        const internalDate = msg.internalDate ? new Date(msg.internalDate) : null;
-
-        if (internalDate && internalDate < cutoff) {
-          dbg('skip uid', uid, 'internalDate', internalDate.toISOString(), '< cutoff', cutoff.toISOString());
-          continue;
-        }
-        if (!fromMatches(env, fromContains)) {
-          dbg('skip uid', uid, 'from', senderBlob(env), 'wanted', fromContains);
-          continue;
-        }
-        if (subjectContains && !subject.toLowerCase().includes(subjectContains.toLowerCase())) {
-          dbg('skip uid', uid, 'subject', subject);
+        const internalDate = new Date(Number(msg.internalDate));
+        if (internalDate < cutoff) {
+          dbg('skip', id, 'too old:', internalDate.toISOString());
           continue;
         }
 
-        const parsed = await simpleParser(msg.source);
-        const htmlStr = parsed.html != null ? String(parsed.html) : '';
-        let code = extractNelnetOtpFromHtml(htmlStr);
+        const body = decodeBody(msg.payload);
+        let code = extractNelnetOtpFromHtml(body.html);
         if (!code) {
-          const combined = [parsed.text, htmlStr.replace(/<[^>]+>/g, ' '), subject].join('\n');
+          const combined = [body.text, body.html.replace(/<[^>]+>/g, ' ')].join('\n');
           code = extractOtpFromText(combined);
         }
+
         if (code && code.length >= 6) {
-          await client.logout();
+          dbg('found code in message', id);
           return code;
         }
-        dbg('skip uid', uid, 'no code in body; from', senderBlob(env));
+        dbg('skip', id, 'no code found in body');
       }
-
-      await client.logout();
     } catch (e) {
-      lastErr = e;
-      dbg('IMAP error', e.message);
-      try {
-        await client.logout();
-      } catch {
-        /* ignore */
-      }
+      dbg('Gmail API error:', e.message);
+      console.error('[mfa-gmail] error:', e.message);
     }
 
     await new Promise((r) => setTimeout(r, pollIntervalMs));
   }
 
-  const hint =
-    ' Try MFA_IMAP_DEBUG=1 (see stderr), MFA_IMAP_MAX_WAIT_MS=300000, clear MFA_EMAIL_SUBJECT_CONTAINS if set, ' +
-    'set MFA_EMAIL_FROM_CONTAINS to a substring of the real From line, or use MFA_IMAP_MAILBOX for the folder that receives the code.';
-
-  throw lastErr instanceof Error
-    ? new Error(`Email MFA failed: ${lastErr.message}.${hint}`)
-    : new Error(`Timed out waiting for a verification code in email.${hint}`);
+  throw new Error('Timed out waiting for a verification code via Gmail API.');
 }
 
 export { extractOtpFromText, extractNelnetOtpFromHtml };

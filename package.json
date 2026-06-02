@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "start": "node scraper.js",
-    "install-browsers": "npx playwright install chromium"
+    "install-browsers": "npx playwright install chromium",
+    "setup-gmail-auth": "node gmail-auth-setup.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
