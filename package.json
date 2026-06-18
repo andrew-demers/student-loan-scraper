@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "start": "node scraper.js",
+    "start:tracey": "node scraper.js --tracey",
     "install-browsers": "npx playwright install chromium",
     "setup-gmail-auth": "node gmail-auth-setup.js"
   },

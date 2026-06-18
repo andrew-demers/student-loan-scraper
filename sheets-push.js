@@ -17,13 +17,14 @@ function formatInterestRate(rate) {
 }
 
 /**
- * Write loan rows to the spreadsheet "Data" tab (columns A–D match your sheet).
+ * Write loan rows to the spreadsheet (columns A–D match your sheet).
  * Requires a Google Cloud service account with Sheets API enabled, and the sheet
  * shared with the service account email as Editor.
  *
  * @param {{ group: string, interestRate: string, principalBalance: string, unpaidInterest: string }[]} loanGroups
+ * @param {string} [tabName] - Override the sheet tab name (defaults to GOOGLE_SHEETS_TAB env var or "Data")
  */
-export async function pushLoanGroupsToGoogleSheet(loanGroups) {
+export async function pushLoanGroupsToGoogleSheet(loanGroups, tabName) {
   const keyPath = process.env.GOOGLE_APPLICATION_CREDENTIALS?.trim();
   if (!keyPath) {
     console.log(
@@ -33,7 +34,7 @@ export async function pushLoanGroupsToGoogleSheet(loanGroups) {
   }
 
   const spreadsheetId = process.env.GOOGLE_SHEETS_SPREADSHEET_ID?.trim() || DEFAULT_SPREADSHEET_ID;
-  const sheetTab = process.env.GOOGLE_SHEETS_TAB?.trim() || DEFAULT_SHEET_TAB;
+  const sheetTab = tabName?.trim() || process.env.GOOGLE_SHEETS_TAB?.trim() || DEFAULT_SHEET_TAB;
 
   let keys;
   try {
@@ -60,13 +61,20 @@ export async function pushLoanGroupsToGoogleSheet(loanGroups) {
   const dataRange = `'${sheetTab}'!A2:D2000`;
 
   try {
-    await sheets.spreadsheets.values.clear({
-      spreadsheetId,
-      range: dataRange,
-    });
+    await sheets.spreadsheets.values.clear({ spreadsheetId, range: dataRange });
   } catch (e) {
-    console.warn('Google Sheets: clear range failed (tab name wrong or no access?):', e.message);
-    return false;
+    // "Internal error" or "Unable to parse range" usually means the tab doesn't exist yet — create it.
+    console.warn(`Google Sheets: tab "${sheetTab}" not found, creating it...`);
+    try {
+      await sheets.spreadsheets.batchUpdate({
+        spreadsheetId,
+        requestBody: { requests: [{ addSheet: { properties: { title: sheetTab } } }] },
+      });
+      await sheets.spreadsheets.values.clear({ spreadsheetId, range: dataRange });
+    } catch (e2) {
+      console.warn('Google Sheets: could not create tab or clear range:', e2.message);
+      return false;
+    }
   }
 
   if (!values.length) {

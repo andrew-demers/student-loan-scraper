@@ -9,12 +9,25 @@ config();
 const USERNAME = process.env.NELNET_USERNAME;
 const PASSWORD = process.env.NELNET_PASSWORD;
 
+const TRACEY_USERNAME = process.env.TRACEY_USERNAME;
+const TRACEY_PASSWORD = process.env.TRACEY_PASSWORD;
+const TRACEY_ACCOUNT_NUMBER = process.env.TRACEY_ACCOUNT_NUMBER;
+const TRACEY_DOB = process.env.TRACEY_DOB;
+const TRACEY_SHEETS_TAB = process.env.TRACEY_SHEETS_TAB || 'Tracey';
+
 /** Optional: Gmail API–based email MFA. Run `npm run setup-gmail-auth` once to get the refresh token. */
 const GMAIL_CLIENT_ID = process.env.GMAIL_CLIENT_ID;
 const GMAIL_CLIENT_SECRET = process.env.GMAIL_CLIENT_SECRET;
 const GMAIL_REFRESH_TOKEN = process.env.GMAIL_REFRESH_TOKEN;
 const MFA_EMAIL_FROM_CONTAINS = process.env.MFA_EMAIL_FROM_CONTAINS;
 const MFA_EMAIL_SUBJECT_CONTAINS = process.env.MFA_EMAIL_SUBJECT_CONTAINS;
+
+/** Optional: separate Gmail OAuth for Tracey's MFA emails (falls back to above if not set). */
+const TRACEY_GMAIL_CLIENT_ID = process.env.TRACEY_GMAIL_CLIENT_ID || GMAIL_CLIENT_ID;
+const TRACEY_GMAIL_CLIENT_SECRET = process.env.TRACEY_GMAIL_CLIENT_SECRET || GMAIL_CLIENT_SECRET;
+const TRACEY_GMAIL_REFRESH_TOKEN = process.env.TRACEY_GMAIL_REFRESH_TOKEN || GMAIL_REFRESH_TOKEN;
+const TRACEY_MFA_EMAIL_FROM_CONTAINS = process.env.TRACEY_MFA_EMAIL_FROM_CONTAINS || 'aidvantage';
+const TRACEY_MFA_EMAIL_SUBJECT_CONTAINS = process.env.TRACEY_MFA_EMAIL_SUBJECT_CONTAINS || undefined;
 
 if (!USERNAME || !PASSWORD) {
   console.error('Missing credentials. Copy .env.example to .env and fill in your username and password.');
@@ -38,6 +51,9 @@ async function acceptFederalDisclaimer(surface) {
       s.locator('#accept-disclaimer'),
       s.locator('button[type="submit"]#accept-disclaimer'),
       s.getByRole('button', { name: /accept federal usage disclaimer/i }),
+      // Aidvantage uses a plain "Accept" button on the full-page disclaimer
+      s.getByRole('button', { name: /^accept$/i }),
+      s.locator('button, input[type="submit"]').filter({ hasText: /^accept$/i }),
     ];
     for (const loc of locators) {
       const n = await loc.count().catch(() => 0);
@@ -825,6 +841,351 @@ async function validateLoanTotalsAgainstCurrentBalance(surface, loanGroups) {
   return { ok, currentText, current, sum, diff };
 }
 
+/**
+ * Aidvantage AllLoanDetails table scraper.
+ * Expands each row via Playwright (the ⊕ buttons in column 1), then reads principal/interest
+ * from the expanded detail rows. Falls back to Current Balance if expansion yields nothing.
+ */
+async function scrapeAidvantageTable(page) {
+
+  return page.evaluate(() => {
+    const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+    const table = document.querySelector('table');
+    if (!table) return [];
+
+    const headerCells = [...table.querySelectorAll('thead th, thead td')]
+      .map((c) => clean(c.textContent).replace(/[↑↓▲▼]/g, '').trim().toLowerCase());
+    const loanIdx    = headerCells.findIndex((h) => /^loan$/.test(h));
+    const balanceIdx = headerCells.findIndex((h) => /current balance/.test(h));
+    const rateIdx    = headerCells.findIndex((h) => /interest rate/.test(h));
+
+    const result = [];
+    let current = null;
+
+    for (const tr of table.querySelectorAll('tbody tr')) {
+      const cells = [...tr.querySelectorAll('td, th')];
+
+      if (cells.length >= 3) {
+        // Main loan row — loan name may be in the second <a> (first is the ⊕ nav link)
+        const nameCell = cells[loanIdx >= 0 ? loanIdx : 0];
+        const nameLinks = nameCell?.querySelectorAll('a');
+        const loanName = clean(
+          (nameLinks?.length > 1 ? nameLinks[nameLinks.length - 1] : nameCell)?.textContent ?? ''
+        ).replace(/^[⊕+\s]+/, '').trim();
+        if (!loanName || /^total/i.test(loanName)) continue;
+
+        current = {
+          group: loanName,
+          principalBalance: clean(cells[balanceIdx >= 0 ? balanceIdx : 1]?.textContent ?? ''),
+          interestRate: clean(cells[rateIdx >= 0 ? rateIdx : 2]?.textContent ?? ''),
+          unpaidInterest: '',
+        };
+        result.push(current);
+      } else if (cells.length > 0 && current) {
+        // Expanded detail row — scan text for principal / accrued interest amounts
+        const txt = clean(cells[0]?.innerText ?? cells[0]?.textContent ?? '');
+        const principal = txt.match(/principal[^$\d]*(\$[\d,]+\.\d{2})/i)?.[1];
+        const unpaid    = txt.match(/(?:unpaid|accrued)[^$\d]*(\$[\d,]+\.\d{2})/i)?.[1];
+        if (principal) current.principalBalance = principal;
+        if (unpaid)    current.unpaidInterest    = unpaid;
+      }
+    }
+
+    return result;
+  });
+}
+
+/**
+ * Aidvantage AllLoanDetails page scraper (legacy).
+ * Tries the Aidvantage-specific card/table layout first, then falls back to the generic scraper.
+ */
+async function scrapeAidvantageLoanDetails(page) {
+  return page.evaluate(() => {
+    const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+
+    // Aidvantage renders loans as cards or accordion rows with labelled dl/dt/dd pairs.
+    // Try to find each loan by its identifying heading, then extract fields.
+    const parseDollars = (el) => {
+      if (!el) return '';
+      const t = clean(el.textContent);
+      const m = t.match(/\$[\d,]+\.\d{2}/);
+      return m ? m[0] : t;
+    };
+
+    const rows = [];
+
+    // Strategy 1: labelled field pairs (dl/dt/dd or div[class*=label]+sibling)
+    const loanSections = [
+      ...document.querySelectorAll('[class*="loan-detail"], [class*="loanDetail"], [class*="loan-card"], [class*="loanCard"], [data-qa*="loan"], [data-testid*="loan"]'),
+    ];
+
+    for (const section of loanSections) {
+      const getText = (...sels) => {
+        for (const sel of sels) {
+          const el = section.querySelector(sel);
+          if (el) return clean(el.textContent);
+        }
+        return '';
+      };
+
+      const heading = getText(
+        'h2, h3, h4, [class*="loan-name"], [class*="loanName"], [class*="loan-type"], [class*="loanType"], [class*="title"]',
+      );
+      if (!heading) continue;
+
+      const sectionText = clean(section.innerText || section.textContent || '');
+      const rate = sectionText.match(/interest\s*rate[:\s]*([\d.]+\s*%)/i)?.[1]?.trim() || '';
+      const monies = [...sectionText.matchAll(/\$[\d,]+\.\d{2}/g)].map((x) => x[0]);
+
+      let principal = '', unpaid = '';
+      const principalEl = section.querySelector('[class*="principal"], [data-qa*="principal"], [data-testid*="principal"]');
+      const unpaidEl = section.querySelector('[class*="unpaid"], [class*="accrued"], [data-qa*="interest"], [data-testid*="interest"]');
+      if (principalEl) principal = parseDollars(principalEl);
+      if (unpaidEl) unpaid = parseDollars(unpaidEl);
+      if (!principal && monies[0]) principal = monies[0];
+      if (!unpaid && monies[1]) unpaid = monies[1];
+
+      rows.push({ group: heading, interestRate: rate, principalBalance: principal, unpaidInterest: unpaid });
+    }
+
+    if (rows.length) return rows;
+
+    // Strategy 2: standard HTML tables (reuse table logic)
+    const out = [];
+    const mapColumns = (headerCells) => {
+      const h = headerCells.map((x) => x.toLowerCase());
+      const idx = (pred) => h.findIndex(pred);
+      return {
+        group: idx((t) => /loan\s*(type|name|id|number|program)|^loan$|subsidiary/i.test(t) && !/rate|balance/i.test(t)),
+        rate: idx((t) => /interest.*rate|^rate$|apr/i.test(t)),
+        principal: idx((t) => /principal.*balance|principal$/i.test(t)),
+        unpaid: idx((t) => /unpaid.*interest|outstanding.*interest|accrued/i.test(t)),
+      };
+    };
+
+    document.querySelectorAll('table').forEach((table) => {
+      let headerRow = table.querySelector('thead tr');
+      let bodyRows = [...table.querySelectorAll('tbody tr')];
+      if (!headerRow && bodyRows.length > 0) { headerRow = bodyRows[0]; bodyRows = bodyRows.slice(1); }
+      if (!headerRow || !bodyRows.length) return;
+      const headerCells = [...headerRow.querySelectorAll('th, td')].map((c) => clean(c.textContent));
+      if (headerCells.length < 2) return;
+      if (!headerCells.some((c) => /principal|interest|balance|rate|loan/i.test(c))) return;
+      const col = mapColumns(headerCells);
+      for (const tr of bodyRows) {
+        const cells = [...tr.querySelectorAll('td, th')].map((c) => clean(c.textContent));
+        if (cells.length < 2) continue;
+        const groupText = col.group >= 0 ? cells[col.group] : cells[0];
+        if (!groupText || /^total|subtotal/i.test(groupText)) continue;
+        out.push({
+          group: groupText,
+          interestRate: col.rate >= 0 ? cells[col.rate] ?? '' : '',
+          principalBalance: col.principal >= 0 ? cells[col.principal] ?? '' : '',
+          unpaidInterest: col.unpaid >= 0 ? cells[col.unpaid] ?? '' : '',
+        });
+      }
+    });
+
+    if (out.length) return out;
+
+    // Strategy 3: scrape dollar amounts with nearby labels from the full page text
+    const pageText = clean(document.body.innerText || '');
+    const loanBlocks = pageText.split(/(?=loan\s+\d+|subsidized|unsubsidized|plus\s+loan|grad\s+plus)/i).filter(Boolean);
+    const fallback = [];
+    for (const block of loanBlocks) {
+      if (!/\$[\d,]+\.\d{2}/.test(block)) continue;
+      const name = block.split('\n')[0].trim().slice(0, 80);
+      const rate = block.match(/interest\s*rate[:\s]*([\d.]+\s*%)/i)?.[1]?.trim() || '';
+      const monies = [...block.matchAll(/\$[\d,]+\.\d{2}/g)].map((x) => x[0]);
+      fallback.push({
+        group: name,
+        interestRate: rate,
+        principalBalance: monies[0] || '',
+        unpaidInterest: monies[1] || '',
+      });
+    }
+    return fallback;
+  });
+}
+
+async function scrapeAidvantage() {
+  if (!TRACEY_USERNAME || !TRACEY_PASSWORD) {
+    console.log('Aidvantage: skipped (set TRACEY_USERNAME and TRACEY_PASSWORD in .env).');
+    return;
+  }
+
+  const browser = await chromium.launch({ headless: false, slowMo: 500 });
+  const page = await browser.newPage();
+  let activePage = page;
+
+  try {
+    console.log('\n=== Scraping Aidvantage (Tracey) ===');
+
+    // Aidvantage requires a cookie/JS check before the login page will accept a session.
+    await page.goto(
+      'https://authenticate2.aidvantage.studentaid.gov/CALM2ED/pages/CALM2CookieJsCheck.jsp?sourceAppName=MYLSP',
+      { waitUntil: 'load', timeout: 60_000 },
+    );
+    // The check page auto-redirects to the login form; wait for it.
+    await page.waitForURL(/\/CALM2ED\/login\.do\?command=showLoginPage/, { timeout: 30_000 }).catch(() => {});
+    await page.waitForLoadState('load', { timeout: 30_000 }).catch(() => {});
+
+    await page.waitForTimeout(1500);
+    await dismissBlockingOverlays(page);
+    await screenshot(page, 'tracey-01-login-page');
+
+    activePage = page;
+    await fillCredentials(activePage, TRACEY_USERNAME, TRACEY_PASSWORD);
+    await screenshot(activePage, 'tracey-02-credentials-filled');
+
+    console.log('Aidvantage: submitting login...');
+    const preLoginUrl = activePage.url();
+    await clickLoginSubmit(activePage);
+    // waitForLoadState('load') resolves immediately on a server-rendered form POST if the page
+    // was already loaded — wait for the URL to actually change away from the login page instead.
+    await Promise.race([
+      activePage.waitForURL((url) => url !== preLoginUrl, { timeout: 60_000 }),
+      activePage
+        .getByText(/receive your authentication code|how do you want|verification|one-time|security code|two.factor|mfa/i)
+        .first()
+        .waitFor({ state: 'visible', timeout: 45_000 }),
+      activePage.locator('input[autocomplete="one-time-code"], input[inputmode="numeric"]').first().waitFor({
+        state: 'visible',
+        timeout: 45_000,
+      }),
+    ]).catch(() => {});
+    await activePage.waitForLoadState('domcontentloaded', { timeout: 30_000 }).catch(() => {});
+    // Wait for ANY input to appear so we know the page has rendered, then snapshot it.
+    await activePage.locator('input').first().waitFor({ state: 'visible', timeout: 15_000 }).catch(() => {});
+    await activePage.waitForTimeout(500);
+    await screenshot(activePage, 'tracey-04-post-login');
+
+    // Aidvantage SSN/DOB verification page (login.do?STEP=1).
+    // Fields confirmed from DOM: tSSN1/tSSN2/tSSN3 (tel), tmonth/tday/tyear (tel).
+    // Submit is input[type="image"] — not caught by clickLoginSubmit.
+    const hasSsnStep = await activePage.locator('input[name="tSSN1"]')
+      .waitFor({ state: 'visible', timeout: 5_000 }).then(() => true).catch(() => false);
+
+    if (hasSsnStep) {
+      console.log('Aidvantage: SSN/DOB verification step detected.');
+      await screenshot(activePage, 'tracey-04b-ssn-dob-page');
+
+      if (TRACEY_ACCOUNT_NUMBER) {
+        await activePage.locator('input[name="taccountNumber"]').fill(TRACEY_ACCOUNT_NUMBER);
+        console.log('Aidvantage: filled account number.');
+      }
+
+      if (TRACEY_DOB) {
+        const [mm, dd, yyyy] = TRACEY_DOB.split('/');
+        await activePage.locator('input[name="tmonth"]').fill(mm);
+        await activePage.locator('input[name="tday"]').fill(dd);
+        await activePage.locator('input[name="tyear"]').fill(yyyy);
+        console.log('Aidvantage: filled DOB.');
+      }
+
+      await screenshot(activePage, 'tracey-04c-ssn-dob-filled');
+      await activePage.locator('button#Submit').click();
+      await activePage.waitForLoadState('domcontentloaded', { timeout: 30_000 }).catch(() => {});
+      await activePage.waitForTimeout(1000);
+    }
+
+    const mfaPrompt = activePage.getByText(/verification|two.factor|mfa|code sent|security code|one-time code/i).first();
+    const mfaNelnetHeading = activePage.getByText(/how do you want to receive your authentication code/i).first();
+    const otpGuess = otpLocator(activePage);
+    const hasMfa =
+      (await mfaPrompt.isVisible().catch(() => false)) ||
+      (await mfaNelnetHeading.isVisible().catch(() => false)) ||
+      (await otpGuess.isVisible().catch(() => false));
+
+    if (hasMfa) {
+      const prepared = await prepareEmailMfaFlow(activePage);
+      if (prepared) console.log('Aidvantage MFA: waiting for email to be delivered...');
+      await activePage.waitForTimeout(prepared ? 1500 : 500);
+
+      const notBefore = prepared ? new Date() : new Date(Date.now() - 2 * 60 * 1000);
+
+      const traceyGmailConfigured = Boolean(TRACEY_GMAIL_CLIENT_ID && TRACEY_GMAIL_CLIENT_SECRET && TRACEY_GMAIL_REFRESH_TOKEN);
+      if (traceyGmailConfigured) {
+        console.log('\nAidvantage MFA: polling inbox via Gmail API...');
+        await activePage.waitForTimeout(prepared ? 1000 : 2500);
+        const maxWaitMs = Number(process.env.MFA_IMAP_MAX_WAIT_MS);
+        const code = await waitForEmailCode({
+          clientId: TRACEY_GMAIL_CLIENT_ID,
+          clientSecret: TRACEY_GMAIL_CLIENT_SECRET,
+          refreshToken: TRACEY_GMAIL_REFRESH_TOKEN,
+          notBefore,
+          maxWaitMs: Number.isFinite(maxWaitMs) && maxWaitMs > 0 ? maxWaitMs : undefined,
+          fromContains: TRACEY_MFA_EMAIL_FROM_CONTAINS,
+          subjectContains: TRACEY_MFA_EMAIL_SUBJECT_CONTAINS,
+        });
+        console.log('Aidvantage: entering code from email and submitting...');
+        await fillOtpAndSubmit(activePage, code);
+        await activePage.waitForLoadState('load', { timeout: 60_000 }).catch(() => {});
+      } else {
+        console.log('\nAidvantage MFA required. Enter the code in the browser, then press Enter here...');
+        await new Promise((resolve) => process.stdin.once('data', resolve));
+        await activePage.waitForLoadState('load', { timeout: 60_000 }).catch(() => {});
+      }
+      await screenshot(activePage, 'tracey-05-post-mfa');
+    }
+
+    console.log('Aidvantage: navigating to All Loan Details...');
+    await activePage.waitForLoadState('load').catch(() => {});
+    await activePage.waitForTimeout(1500);
+    await acceptFederalDisclaimer(activePage);
+
+    await activePage.goto('https://myaccount.aidvantage.studentaid.gov/Loans/AllLoanDetails', {
+      waitUntil: 'load',
+      timeout: 45_000,
+    });
+    await activePage.waitForTimeout(2000);
+    await acceptFederalDisclaimer(activePage);
+    await screenshot(activePage, 'tracey-06-loan-details');
+
+    // Scroll to trigger any lazy-loaded content
+    for (let s = 0; s < 8; s++) {
+      await activePage.evaluate(() => window.scrollBy(0, 700));
+      await activePage.waitForTimeout(200);
+    }
+    await activePage.evaluate(() => window.scrollTo(0, 0));
+    await activePage.waitForTimeout(400);
+
+    let loanGroups = await scrapeAidvantageTable(activePage);
+    if (!loanGroups.length) loanGroups = await scrapeAidvantageLoanDetails(activePage);
+    if (!loanGroups.length) loanGroups = await scrapeLoanGroupsFromPage(activePage);
+    if (!loanGroups.length) {
+      for (const fr of activePage.frames()) {
+        if (fr === activePage.mainFrame()) continue;
+        loanGroups = await scrapeAidvantageLoanDetails(fr);
+        if (!loanGroups.length) loanGroups = await scrapeLoanGroupsFromPage(fr);
+        if (loanGroups.length) break;
+      }
+    }
+
+    if (!loanGroups.length) {
+      console.log('\nAidvantage: no loan rows parsed. Dollar amounts on page (fallback):');
+      const amounts = await activePage.locator('text=/\\$[\\d,]+\\.\\d{2}/').allTextContents();
+      amounts.forEach((a) => console.log(' ', a.trim()));
+      console.log('Inspect screenshots/tracey-06-loan-details.png to tighten selectors.');
+    } else {
+      console.log(`\n--- Aidvantage loan groups (${loanGroups.length}) ---`);
+      for (const row of loanGroups) {
+        console.log(
+          `• ${row.group}\n  Interest rate: ${row.interestRate || '—'}\n  Principal balance: ${row.principalBalance || '—'}\n  Unpaid interest: ${row.unpaidInterest || '—'}`,
+        );
+      }
+      await pushLoanGroupsToGoogleSheet(loanGroups, TRACEY_SHEETS_TAB);
+    }
+
+  } catch (err) {
+    console.error('Aidvantage scraper error:', err.message);
+    await screenshot(activePage, 'tracey-error');
+    console.log('Screenshot saved to screenshots/tracey-error.png');
+  } finally {
+    await browser.close();
+  }
+}
+
 async function scrapeNelnet() {
   const browser = await chromium.launch({ headless: false, slowMo: 500 });
   const page = await browser.newPage();
@@ -1039,4 +1400,14 @@ async function scrapeNelnet() {
   }
 }
 
-scrapeNelnet();
+async function main() {
+  const traceyOnly = process.argv.includes('--tracey');
+  if (traceyOnly) {
+    await scrapeAidvantage();
+  } else {
+    await scrapeNelnet();
+    await scrapeAidvantage();
+  }
+}
+
+main();
