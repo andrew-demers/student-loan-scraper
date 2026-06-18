@@ -843,12 +843,12 @@ async function validateLoanTotalsAgainstCurrentBalance(surface, loanGroups) {
 
 /**
  * Aidvantage AllLoanDetails table scraper.
- * Expands each row via Playwright (the ⊕ buttons in column 1), then reads principal/interest
- * from the expanded detail rows. Falls back to Current Balance if expansion yields nothing.
+ * Step 1: reads the summary table (loan name, current balance, interest rate + detail page URLs).
+ * Step 2: visits each loan detail page to extract principal balance and unpaid interest.
  */
 async function scrapeAidvantageTable(page) {
-
-  return page.evaluate(() => {
+  // Step 1 — extract rows and their detail-page hrefs from the summary table
+  const loans = await page.evaluate(() => {
     const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
     const table = document.querySelector('table');
     if (!table) return [];
@@ -859,40 +859,67 @@ async function scrapeAidvantageTable(page) {
     const balanceIdx = headerCells.findIndex((h) => /current balance/.test(h));
     const rateIdx    = headerCells.findIndex((h) => /interest rate/.test(h));
 
-    const result = [];
-    let current = null;
-
-    for (const tr of table.querySelectorAll('tbody tr')) {
-      const cells = [...tr.querySelectorAll('td, th')];
-
-      if (cells.length >= 3) {
-        // Main loan row — loan name may be in the second <a> (first is the ⊕ nav link)
+    return [...table.querySelectorAll('tbody tr')]
+      .filter((tr) => tr.querySelectorAll('td, th').length >= 3)
+      .flatMap((tr) => {
+        const cells = [...tr.querySelectorAll('td, th')];
         const nameCell = cells[loanIdx >= 0 ? loanIdx : 0];
-        const nameLinks = nameCell?.querySelectorAll('a');
-        const loanName = clean(
-          (nameLinks?.length > 1 ? nameLinks[nameLinks.length - 1] : nameCell)?.textContent ?? ''
-        ).replace(/^[⊕+\s]+/, '').trim();
-        if (!loanName || /^total/i.test(loanName)) continue;
-
-        current = {
+        const links = [...(nameCell?.querySelectorAll('a') ?? [])];
+        const loanLink = links.find((a) => a.textContent.trim().length > 2) ?? links[0];
+        const loanName = clean(loanLink?.textContent ?? nameCell?.textContent ?? '')
+          .replace(/^[⊕+\s]+/, '').trim();
+        if (!loanName || /^total/i.test(loanName)) return [];
+        return [{
           group: loanName,
+          href: loanLink?.href ?? '',
           principalBalance: clean(cells[balanceIdx >= 0 ? balanceIdx : 1]?.textContent ?? ''),
           interestRate: clean(cells[rateIdx >= 0 ? rateIdx : 2]?.textContent ?? ''),
           unpaidInterest: '',
-        };
-        result.push(current);
-      } else if (cells.length > 0 && current) {
-        // Expanded detail row — scan text for principal / accrued interest amounts
-        const txt = clean(cells[0]?.innerText ?? cells[0]?.textContent ?? '');
-        const principal = txt.match(/principal[^$\d]*(\$[\d,]+\.\d{2})/i)?.[1];
-        const unpaid    = txt.match(/(?:unpaid|accrued)[^$\d]*(\$[\d,]+\.\d{2})/i)?.[1];
-        if (principal) current.principalBalance = principal;
-        if (unpaid)    current.unpaidInterest    = unpaid;
-      }
-    }
-
-    return result;
+        }];
+      });
   });
+
+  if (!loans.length) return [];
+
+  // Step 2 — visit each detail page to get principal balance and unpaid interest
+  for (let i = 0; i < loans.length; i++) {
+    const loan = loans[i];
+    if (!loan.href) continue;
+    try {
+      await page.goto(loan.href, { waitUntil: 'load', timeout: 30_000 });
+      await page.waitForTimeout(800);
+      if (i === 0) await page.screenshot({ path: './screenshots/tracey-detail-sample.png' });
+
+      const detail = await page.evaluate(() => {
+        const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+        const body = clean(document.body.innerText ?? '');
+        const allAmounts = [...body.matchAll(/\$[\d,]+\.\d{2}/g)].map((m) => m[0]);
+
+        const principal =
+          body.match(/principal\s*balance[^$\d]*(\$[\d,]+\.\d{2})/i)?.[1] ||
+          body.match(/outstanding\s*principal[^$\d]*(\$[\d,]+\.\d{2})/i)?.[1] ||
+          body.match(/principal[^$\d]*(\$[\d,]+\.\d{2})/i)?.[1] || '';
+
+        const unpaid =
+          body.match(/(?:unpaid|accrued)\s*interest[^$\d]*(\$[\d,]+\.\d{2})/i)?.[1] ||
+          body.match(/interest\s*accrued[^$\d]*(\$[\d,]+\.\d{2})/i)?.[1] ||
+          body.match(/accrued[^$\d]*(\$[\d,]+\.\d{2})/i)?.[1] || '';
+
+        return { principal, unpaid, allAmounts: allAmounts.slice(0, 6) };
+      });
+
+      if (detail.principal) loan.principalBalance = detail.principal;
+      if (detail.unpaid)    loan.unpaidInterest    = detail.unpaid;
+
+      if (!detail.principal) {
+        console.log(`  [${loan.group}] amounts on page: ${detail.allAmounts.join(', ')}`);
+      }
+    } catch (e) {
+      console.warn(`  Aidvantage: detail page error for ${loan.group}: ${e.message}`);
+    }
+  }
+
+  return loans.map(({ href: _href, ...rest }) => rest);
 }
 
 /**
