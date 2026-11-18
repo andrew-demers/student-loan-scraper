@@ -1240,11 +1240,23 @@ async function scrapeNelnet() {
       .getByRole('button', { name: /log in/i })
       .or(page.getByRole('link', { name: /sign in|log in|login/i }))
       .first();
-    await logIn.waitFor({ state: 'visible', timeout: 20_000 });
+    // The site sometimes lands straight on the login form (no "Log In" button), so accept either.
+    const loginFormAlready = passwordLocator(page);
+    const appeared = await Promise.any([
+      logIn.waitFor({ state: 'visible', timeout: 45_000 }).then(() => 'button'),
+      loginFormAlready.waitFor({ state: 'visible', timeout: 45_000 }).then(() => 'form'),
+    ]).catch(() => null);
 
-    activePage = await getLoginPageAfterClick(page, async () => {
-      await logIn.click({ force: true });
-    });
+    if (appeared === 'button') {
+      activePage = await getLoginPageAfterClick(page, async () => {
+        await logIn.click({ force: true });
+      });
+    } else if (appeared === 'form') {
+      console.log('Login form already showing; skipping Log In click.');
+      activePage = page;
+    } else {
+      throw new Error('Neither a Log In button nor a login form appeared on the Nelnet landing page.');
+    }
     await dismissBlockingOverlays(activePage);
     await screenshot(activePage, '02-login-page');
 
